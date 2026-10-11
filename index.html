@@ -1195,6 +1195,7 @@ function onPick(h){
 }
 function isAncestor(a, n){ for (let x = n; x; x = x.parent) if (x === a) return true; return false; }
 function selectNode(n, fromTree=false){
+  if (lathe.on && n && n !== treeRoot && n !== lathe.node){ lathe.node = n; updateAxisLine(); setStatus(`Tornio: ora gira ${n.name}.`); }
   if (fromTree && ui.tool === 'move'){ setMoveNode(n); return; }
   if (fromTree && ui.tool !== 'select') setTool('select');
   ui.selNode = n; ui.picks = [];
@@ -1230,6 +1231,7 @@ tc.addEventListener('objectChange', () => {
 });
 function setMoveNode(n){
   ui.moveNode = n;
+  if (lathe.on && n && n !== lathe.node){ lathe.node = n; setStatus(`Tornio: ora gira ${n.name}.`); }
   clearOverlays('sel');
   if (n){
     nodeParts(n).filter(p => p.visible).forEach(p => overlays.sel.push(...overlayFor({ part:p }, 'sel')));
@@ -1351,13 +1353,63 @@ const lathe = { on:false, node:null, speed:30 };   // 30°/s = 5 giri/min
 function latheNode(){
   if (ui.moveNode) return ui.moveNode;
   if (ui.selNode && ui.selNode !== treeRoot) return ui.selNode;
-  const cy = mainCylinders()[0]; if (cy) return cy.part.node;
-  if (!parts.length) return null;
-  return parts.reduce((a, b) => partBoxModel(b).getSize(V()).length() > partBoxModel(a).getSize(V()).length() ? b : a).node;
+  const best = latheCandidate(); if (best) return best.node;
+  if (parts.length === 1) return parts[0].node;
+  return null;
+}
+// il pezzo da tornire: solido quasi tutto di rivoluzione attorno al suo asse e allungato lungo l'asse
+// (un albero sì; banco, testa, griffe, carter no). Punteggio = volume × allungamento.
+function latheCandidate(){
+  // asse del mandrino: il cilindro intero più grande del modello (piattaforma, mandrino o il pezzo stesso)
+  let spindle = null;
+  const cyls = [];
+  for (const p of parts.filter(p => p.visible)){
+    const an = p.an, done = new Set();
+    for (let f = 0; f < an.nF; f++){
+      if (done.has(f)) continue;
+      const fi = faceInfo(an, f); if (fi.type !== 'cyl') continue;
+      const g = cylGroup(an, f); g.faces.forEach(x => done.add(x));
+      if (g.full){ const c = { r:fi.r * p.k, d:dirToModel(p, fi.axis).normalize(), p:toModel(p, fi.ap) }; if (!spindle || c.r > spindle.r) spindle = c; }
+    }
+  }
+  const onSpindle = (p, fi) => {
+    if (!spindle) return false;
+    const d = dirToModel(p, fi.axis).normalize(); if (Math.abs(d.dot(spindle.d)) < 0.999) return false;
+    const w = toModel(p, fi.ap).sub(spindle.p); w.addScaledVector(spindle.d, -w.dot(spindle.d));
+    return w.length() < Math.max(5, 0.02 * spindle.r);
+  };
+  let best = null;
+  for (const p of parts.filter(p => p.visible)){
+    const an = p.an, done = new Set(); let main = null;
+    for (let f = 0; f < an.nF; f++){
+      if (done.has(f)) continue;
+      const fi = faceInfo(an, f); if (fi.type !== 'cyl') continue;
+      const g = cylGroup(an, f); g.faces.forEach(x => done.add(x));
+      if (!main || g.area > main.g.area) main = { g, fi };
+    }
+    if (!main) continue;
+    const ax = main.fi.axis, ap = main.fi.ap, tol = 0.02 * main.fi.r + 1e-6;
+    let rev = 0, tot = 0;
+    for (let f = 0; f < an.nF; f++){
+      const fi = faceInfo(an, f); tot += fi.area;
+      if (fi.type === 'plane' && Math.abs(fi.n.dot(ax)) > 0.999) rev += fi.area;
+      else if (fi.type === 'cyl' && Math.abs(fi.axis.dot(ax)) > 0.999){ const w = fi.ap.clone().sub(ap); if (w.sub(ax.clone().multiplyScalar(w.dot(ax))).length() < tol) rev += fi.area; }
+    }
+    if (!tot || rev / tot < 0.6) continue;
+    const s = p.geo.boundingBox.getSize(V()), len = Math.abs(s.dot(ax)), dia = 2 * main.fi.r;
+    // sull'asse del mandrino vale molto di più: il pezzo è montato lì
+    const score = partMass(p).vol * Math.min(1, len / Math.max(dia, 1e-9)) * (onSpindle(p, main.fi) ? 1000 : 1);
+    if (!best || score > best.score) best = { score, node:p.node, diag:s.length() * p.k };
+  }
+  // un pezzo minuscolo rispetto al modello (una vite) non è il pezzo da tornire
+  if (best && modelBox && best.diag < 0.05 * modelBox.getSize(V()).length()) return null;
+  return best;
 }
 function setLathe(on){
   if (on){
-    const n = latheNode(); if (!n) return;
+    const n = latheNode();
+    if (!n){ setStatus('Non trovo il pezzo da tornire: selezionalo (nell\'albero, con Seleziona o nel visore in Muovi) e premi di nuovo Tornio.', true); xr.latheHint = true; drawPanel(); return; }
+    xr.latheHint = false;
     lathe.node = n; lathe.on = true; spin.on = false;
     const a = getAxis(n);
     setStatus(`Tornio: ${n.name} gira sul proprio asse${a.r ? ' (Ø ' + nf(2*a.r) + ')' : ''}. Premi di nuovo Tornio per fermarlo.`);
@@ -1920,14 +1972,14 @@ async function loadStep(name, buf, pre=null){
     const fc = m.brep_faces?.find(f => f.color)?.color;
     const color = m.color ? rgbHex(m.color) : fc ? rgbHex(fc) : nextColor();
     if (++done % 4 === 0) await setBusy(`Preparo facce e spigoli (${done} di ${res.meshes.length})…`);
-    return makePart({ name:label || m.name || ('Corpo ' + (i+1)), geo, color, k:1, brep:m.brep_faces, kind:'step' });
+    return makePart({ name:cleanName(label || m.name || ('Corpo ' + (i+1))), geo, color, k:1, brep:m.brep_faces, kind:'step' });
   };
   const conv = async n => {
-    const node = { name:n.name || name, children:[] };
+    const node = { name:cleanName(n.name || name), children:[] };
     for (const c of n.children || []) node.children.push(await conv(c));
     const ms = n.meshes || [];
     if (ms.length === 1 && !node.children.length){ node.part = await makeMeshPart(ms[0], n.name || res.meshes[ms[0]].name); }
-    else for (const i of ms) node.children.push({ name:res.meshes[i].name || node.name, part: await makeMeshPart(i, res.meshes[i].name || node.name), children:[] });
+    else for (const i of ms) node.children.push({ name:cleanName(res.meshes[i].name || node.name), part: await makeMeshPart(i, res.meshes[i].name || node.name), children:[] });
     return node;
   };
   let top = await conv(res.root);
@@ -2528,7 +2580,8 @@ function drawPanelNow(){
     const name = treeRoot ? treeRoot.name : 'Nessun modello';
     txt(name.toUpperCase(), 30, 246, `600 40px ${DISPLAY}`, '#FFFFFF');
     if (modelBox){ const s = modelBox.getSize(V()); txt(`${nf(s.x,0)} × ${nf(s.y,0)} × ${nf(s.z,0)} mm · ${triCount().toLocaleString('it-IT')} triangoli`, 30, 284, `500 28px ${MONO}`, '#A9BCCB'); }
-    if (lathe.on){ const a = getAxis(lathe.node); txt(`TORNIO: ${lathe.node.name} gira sul suo asse${a.r ? ' · Ø ' + nf(2*a.r, 0) : ''} · 5 giri/min`, 30, 708, `600 24px ${BODY}`, '#FF8A66'); }
+    if (!lathe.on && xr.latheHint) txt('Tornio: non trovo il pezzo. Toccalo in Muovi, poi premi di nuovo Tornio.', 30, 708, `600 24px ${BODY}`, '#FF8A66');
+    else if (lathe.on){ const a = getAxis(lathe.node); txt(`TORNIO: gira ${lathe.node.name}${a.r ? ' · Ø ' + nf(2*a.r, 0) : ''} · per cambiarlo toccalo in Muovi`, 30, 708, `600 24px ${BODY}`, '#FF8A66'); }
     else txt(settings.panelMode === 'fisso' ? 'Sposta il menu dalla barra in alto · il modello col grilletto sinistro' : 'Modello: grilletto sinistro o tasto laterale, due mani per scalare', 30, 708, `400 23px ${BODY}`, '#8FA3B3');
   } else if (xr.tab === 'misura'){
     const r = ui.result;
