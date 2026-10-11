@@ -1807,7 +1807,102 @@ let colorSeq = 0;
 const nextColor = () => PALETTE[colorSeq++ % PALETTE.length];
 const rgbHex = c => '#' + c.map(v => Math.round(Math.min(1, Math.max(0, v)) * 255).toString(16).padStart(2, '0')).join('');
 
-async function loadStep(name, buf){
+// Legge la struttura di un assieme STEP che rimanda a file esterni (SolidWorks "componenti come file STEP separati").
+function parseStepAssembly(text){
+  const ent = new Map();
+  const re = /#(\d+)\s*=\s*([\s\S]*?);\s*(?=#\d+\s*=|ENDSEC)/g;
+  const data = text.slice(text.indexOf('DATA;') + 5);
+  let m;
+  while ((m = re.exec(data))) ent.set(+m[1], m[2].trim());
+  const refs = s => [...s.matchAll(/#(\d+)/g)].map(x => +x[1]);
+  const typeOf = s => (s.match(/^\(?\s*([A-Z_0-9]+)/) || [])[1];
+  const str = s => [...s.matchAll(/'((?:[^']|'')*)'/g)].map(x => x[1].replace(/''/g, "'"));
+  const nums = s => [...s.matchAll(/-?\d+(?:\.\d*)?(?:E[-+]?\d+)?/gi)].map(Number);
+  if (![...ent.values()].some(s => typeOf(s) === 'NEXT_ASSEMBLY_USAGE_OCCURRENCE')) return null;
+  // prodotti e definizioni
+  const productName = new Map();
+  for (const [id, s] of ent) if (typeOf(s) === 'PRODUCT') productName.set(id, str(s)[0]);
+  const formProduct = new Map();
+  for (const [id, s] of ent){ const t = typeOf(s); if (t && t.startsWith('PRODUCT_DEFINITION_FORMATION')) formProduct.set(id, refs(s)[0]); }
+  const pdProduct = new Map();
+  for (const [id, s] of ent) if (typeOf(s) === 'PRODUCT_DEFINITION'){ const r = refs(s); pdProduct.set(id, formProduct.get(r[0])); }
+  // forma della definizione -> rappresentazione
+  const pdsOf = new Map();   // definizione (PD o NAUO) -> PRODUCT_DEFINITION_SHAPE
+  for (const [id, s] of ent) if (typeOf(s) === 'PRODUCT_DEFINITION_SHAPE') pdsOf.set(refs(s)[0], id);
+  const repOfPds = new Map();
+  for (const [id, s] of ent) if (typeOf(s) === 'SHAPE_DEFINITION_REPRESENTATION'){ const [pds, rep] = refs(s); repOfPds.set(pds, rep); }
+  const repItems = id => { const s = ent.get(id); if (!s) return []; const inner = s.slice(s.indexOf('(') + 1); const lst = inner.match(/\(([^()]*)\)/); return lst ? refs(lst[1]) : []; };
+  const axis = id => {
+    const r = refs(ent.get(id)), P = nums(ent.get(r[0]).replace(/^[^(]*\(\s*'[^']*'\s*,/, ''));
+    const dir = k => r[k] ? nums(ent.get(r[k]).replace(/^[^(]*\(\s*'[^']*'\s*,/, '')) : null;
+    let z = dir(1) || [0,0,1], x = dir(2) || [1,0,0];
+    const n = v => { const l = Math.hypot(...v); return v.map(c => c / l); };
+    z = n(z); const d = x[0]*z[0] + x[1]*z[1] + x[2]*z[2]; x = n([x[0]-d*z[0], x[1]-d*z[1], x[2]-d*z[2]]);
+    const y = [z[1]*x[2]-z[2]*x[1], z[2]*x[0]-z[0]*x[2], z[0]*x[1]-z[1]*x[0]];
+    return [x[0],x[1],x[2],0, y[0],y[1],y[2],0, z[0],z[1],z[2],0, P[0],P[1],P[2],1];   // colonne (Matrix4.elements)
+  };
+  // relazioni con trasformazione: rep_1, rep_2, item_defined_transformation
+  const rels = [];
+  for (const [id, s] of ent) if (s.includes('REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION')){
+    const rr = s.match(/REPRESENTATION_RELATIONSHIP\s*\(([^)]*)\)/), rt = s.match(/REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION\s*\(([^)]*)\)/);
+    const [r1, r2] = refs(rr[1]), idt = refs(rt[1])[0];
+    rels.push({ id, r1, r2, idt });
+  }
+  const cdsr = new Map();   // PDS della NAUO -> relazione
+  for (const [id, s] of ent) if (typeOf(s) === 'CONTEXT_DEPENDENT_SHAPE_REPRESENTATION'){ const [rel, pds] = refs(s); cdsr.set(pds, rel); }
+  const occ = [];
+  for (const [id, s] of ent) if (typeOf(s) === 'NEXT_ASSEMBLY_USAGE_OCCURRENCE'){
+    const r = refs(s), nm = str(s);
+    const parent = pdProduct.get(r[0]), child = pdProduct.get(r[1]);
+    const rel = rels.find(x => x.id === cdsr.get(pdsOf.get(id)));
+    const I = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
+    let mat = { parent:I, child:I };
+    if (rel){
+      const t = refs(ent.get(rel.idt)), a1 = t[0], a2 = t[1];
+      const parentRep = repOfPds.get(pdsOf.get(r[0]));
+      // l'asse che appartiene alla rappresentazione del padre va nel padre, l'altro nel figlio
+      const inParent = repItems(parentRep).includes(a2) ? a2 : repItems(parentRep).includes(a1) ? a1 : (rel.r2 === parentRep ? a2 : a1);
+      const inChild = inParent === a2 ? a1 : a2;
+      mat = { parent:axis(inParent), child:axis(inChild) };
+    }
+    occ.push({ id, name:nm[1] || nm[0], parentPD:r[0], childPD:r[1], parent:productName.get(parent), child:productName.get(child), mat });
+  }
+  const files = [...ent.values()].filter(s => typeOf(s) === 'DOCUMENT_FILE').map(s => str(s)[0]);
+  const childSet = new Set(occ.map(o => o.child));
+  const root = occ.map(o => o.parent).find(p => !childSet.has(p)) || null;
+  return { occ, files, root, products:[...productName.values()] };
+}
+function stepProductName(text){ const m = text.match(/=\s*PRODUCT\s*\(\s*'((?:[^']|'')*)'/); return m ? m[1].replace(/''/g, "'") : null; }
+
+const hasSolid = t => /MANIFOLD_SOLID_BREP|BREP_WITH_VOIDS|SHELL_BASED_SURFACE_MODEL|ADVANCED_FACE|FACETED_BREP/.test(t);
+const cleanName = n => String(n || '').replace(/_[^_<]*<[^>]*>$/, '').trim() || n;
+// assieme con i pezzi in file separati: ogni pezzo va nella posizione scritta nel file dell'assieme
+async function buildExternalAssembly(A, byProduct, used, missing, M0 = new THREE.Matrix4()){
+  const occ = A.asm.occ, childSet = new Set(occ.map(o => o.child));
+  const rootName = occ.map(o => o.parent).find(p => !childSet.has(p)) || A.product;
+  const build = async (prodName, M, depth) => {
+    const node = { name:cleanName(prodName), children:[] };
+    const mine = occ.filter(o => o.parent === prodName), tot = {}, cnt = {};
+    mine.forEach(o => tot[o.child] = (tot[o.child] || 0) + 1);
+    for (const o of mine){
+      const Mi = M.clone().multiply(new THREE.Matrix4().fromArray(o.mat.parent)).multiply(new THREE.Matrix4().fromArray(o.mat.child).invert());
+      cnt[o.child] = (cnt[o.child] || 0) + 1;
+      const label = cleanName(o.child) + (tot[o.child] > 1 ? ` <${cnt[o.child]}>` : '');
+      if (depth < 8 && occ.some(x => x.parent === o.child)){ const sub = await build(o.child, Mi, depth + 1); sub.name = label; node.children.push(sub); continue; }
+      const f = byProduct.get(o.child);
+      if (!f){ if (!missing.includes(cleanName(o.child))) missing.push(cleanName(o.child)); continue; }
+      used.add(f);
+      let n;
+      if (f.asm) n = await buildExternalAssembly(f, byProduct, used, missing, Mi);
+      else n = await loadStep(cleanName(o.child), f.buf, Mi);
+      n.name = label; node.children.push(n);
+    }
+    return node;
+  };
+  return build(rootName, M0, 0);
+}
+
+async function loadStep(name, buf, pre=null){
   await setBusy('Preparo il lettore STEP (circa 8 MB, solo la prima volta)…');
   const occt = await loadOcct();
   await setBusy(`Leggo ${name}…`);
@@ -1821,6 +1916,7 @@ async function loadStep(name, buf){
     geo.setAttribute('position', new THREE.Float32BufferAttribute(m.attributes.position.array, 3));
     if (m.attributes.normal) geo.setAttribute('normal', new THREE.Float32BufferAttribute(m.attributes.normal.array, 3));
     geo.setIndex(new THREE.Uint32BufferAttribute(Uint32Array.from(m.index.array), 1));
+    if (pre) geo.applyMatrix4(pre);   // posizione del pezzo nell'assieme (file separati)
     const fc = m.brep_faces?.find(f => f.color)?.color;
     const color = m.color ? rgbHex(m.color) : fc ? rgbHex(fc) : nextColor();
     if (++done % 4 === 0) await setBusy(`Preparo facce e spigoli (${done} di ${res.meshes.length})…`);
@@ -1890,10 +1986,27 @@ async function openFiles(files){
     for (const f of list){ try { items.push(...await expand(f)); } catch (e){ fail.push(`${f.name}: ${e.message}`); } }
     if (!items.length) throw new Error(fail.join('; '));
     clearModel();
+    // STEP esportato da SolidWorks con "componenti dell'assieme come file separati":
+    // un file con la sola struttura (posizioni) e un file per ogni pezzo
+    const dec = new TextDecoder('latin1'), missing = [], used = new Set();
+    const steps = items.filter(it => ['step','stp'].includes(extOf(it.name)));
+    for (const it of steps){
+      const txt = dec.decode(it.buf);
+      it.asm = hasSolid(txt) ? null : parseStepAssembly(txt);
+      it.product = it.asm ? it.asm.root : stepProductName(txt);   // per l'assieme conta il prodotto radice
+    }
+    const byProduct = new Map(steps.filter(it => it.product).map(it => [it.product, it]));
+    const asms = steps.filter(it => it.asm), referenced = new Set(asms.flatMap(a => a.asm.occ.map(o => o.child)));
+    for (const A of asms.filter(a => !referenced.has(a.product))){
+      try { await setBusy(`Monto l'assieme ${A.name.split('/').pop()}…`); nodes.push(await buildExternalAssembly(A, byProduct, used, missing)); used.add(A); }
+      catch (e){ console.error(e); fail.push(`${A.name.split('/').pop()}: ${e.message}`); }
+    }
     for (const it of items){
+      if (it.asm || used.has(it)) continue;
       try { await setBusy(`Carico ${it.name.split('/').pop()}…`); nodes.push(await loadOne(it.name, it.buf)); }
       catch (e){ console.error(e); fail.push(`${it.name.split('/').pop()}: ${e.message}`); }
     }
+    if (missing.length) fail.push(`l'assieme cita file che non hai aperto: ${missing.join(', ')}`);
     treeRoot = nodes.length === 1 ? nodes[0] : { name: list.length === 1 ? list[0].name.replace(/\.[^.]+$/, '') : 'Modello', children:nodes };
     linkTree(treeRoot);
     $('#docname').textContent = list.length === 1 ? list[0].name : `${list.length} file`;
