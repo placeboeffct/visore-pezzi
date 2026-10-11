@@ -228,7 +228,7 @@ details.help[open] summary{margin-bottom:8px}
         <button type="button" data-view="right">Destra</button>
         <button type="button" data-view="fit" title="Adatta (F)">Adatta</button>
       </div>
-      <div class="tb"><button type="button" id="edgesBtn" aria-pressed="true">Spigoli</button></div>
+      <div class="tb"><button type="button" id="edgesBtn" aria-pressed="true">Spigoli</button><button type="button" id="latheBtn" aria-pressed="false" title="Fa girare il pezzo sul proprio asse, come sul tornio">Tornio</button></div>
     </div>
   </nav>
 
@@ -282,6 +282,7 @@ details.help[open] summary{margin-bottom:8px}
             <dt>Modello</dt><dd>Afferra con il grilletto della sinistra o con il tasto laterale. Due mani: scala e ruota; vicino a 1:1 si aggancia.</dd>
             <dt>Misura</dt><dd>Con la destra punta facce, spigoli, fori e vertici e premi il grilletto.</dd>
             <dt>Sezione</dt><dd>Afferra la maniglia arancione per spostare il taglio.</dd>
+            <dt>Tornio</dt><dd>Pulsante nel menu Modello (e in presentazione): il pezzo gira sul proprio asse, linea blu tratteggiata. Gira il pezzo selezionato o, se non c'è selezione, quello con il cilindro più grande. Si ferma premendolo di nuovo.</dd>
             <dt>Muovi</dt><dd>La levetta destra fa girare il componente sul proprio asse, come sul tornio (linea blu); c'è anche Gira continuo. Punta un componente con la destra e tieni premuto il grilletto: il pezzo segue la mano, lo sposti e lo giri in ogni direzione. La levetta destra lo ruota sulla verticale; i tasti 90° su X/Y/Z lo ribaltano esatto. Con Solo X/Y/Z si sposta solo lungo quell'asse.</dd>
             <dt>Presentazione</dt><dd>Dal menu Modello nel visore. Porta il modello a 1:1 e lascia nel menu solo Misura, Sposta e Sezione, con Dimostrazione (circa 40 s: crescita a 1:1, ingombro, diametri, sezione, esploso o rotazione sull'asse; Interrompi la ferma), Ripristina, Modello davanti e Menu completo per tornare al menu normale. Il modello, i pezzi e il menu si spostano come sempre.</dd>
             <dt>Tasti</dt><dd><kbd>A</kbd> 1:1 o tavolo · <kbd>B</kbd> ruota 90° · <kbd>X</kbd> a terra · levette per scorrere e ruotare</dd>
@@ -1266,14 +1267,37 @@ function spinNode(n, degs){
 }
 function updateAxisLine(){
   clearGroup(axisGroup);
-  const n = ui.moveNode;
-  if (!n || !(ui.tool === 'move' || (renderer.xr.isPresenting && xr.tab === 'muovi')) || xr.tour) return;
+  const n = lathe.on ? lathe.node : ui.moveNode;
+  if (!n || xr.tour || !(lathe.on || ui.tool === 'move' || (renderer.xr.isPresenting && xr.tab === 'muovi'))) return;
   const a = getAxis(n), ext = nodeBox(n).getSize(V()).length() * 0.6;
   const l = lineSeg([[a.p.clone().addScaledVector(a.d, -ext), a.p.clone().addScaledVector(a.d, ext)]], axisMat);
   axisMat.dashSize = ext / 25; axisMat.gapSize = ext / 50; l.computeLineDistances();
   axisGroup.add(l);
 }
 function setSpin(on){ spin.on = on; renderProps(); drawPanel(); }
+
+/* Tornio: un solo pulsante, sempre disponibile. Fa girare sul proprio asse il pezzo selezionato
+   oppure, se non è selezionato niente, il pezzo con il cilindro principale più grande. */
+const lathe = { on:false, node:null, speed:30 };   // 30°/s = 5 giri/min
+function latheNode(){
+  if (ui.moveNode) return ui.moveNode;
+  if (ui.selNode && ui.selNode !== treeRoot) return ui.selNode;
+  const cy = mainCylinders()[0]; if (cy) return cy.part.node;
+  if (!parts.length) return null;
+  return parts.reduce((a, b) => partBoxModel(b).getSize(V()).length() > partBoxModel(a).getSize(V()).length() ? b : a).node;
+}
+function setLathe(on){
+  if (on){
+    const n = latheNode(); if (!n) return;
+    lathe.node = n; lathe.on = true; spin.on = false;
+    const a = getAxis(n);
+    setStatus(`Tornio: ${n.name} gira sul proprio asse${a.r ? ' (Ø ' + nf(2*a.r) + ')' : ''}. Premi di nuovo Tornio per fermarlo.`);
+  } else if (lathe.on){
+    lathe.on = false; afterMove(); setStatus('Tornio fermo.');
+  }
+  $('#latheBtn').setAttribute('aria-pressed', String(lathe.on));
+  updateAxisLine(); renderProps(); drawPanel();
+}
 
 /* ================= sezione ================= */
 const section = { mode:'off', a:V(0,1,0), pos:0, keepNeg:true, fill:true, base:0, min:0, max:1 };
@@ -1594,6 +1618,7 @@ function setView(v){
 }
 $('#edgesBtn').addEventListener('click', () => { settings.edges = !settings.edges; saveSettings(); $('#edgesBtn').setAttribute('aria-pressed', String(settings.edges)); parts.forEach(applyLook); });
 $('#edgesBtn').setAttribute('aria-pressed', String(settings.edges));
+$('#latheBtn').addEventListener('click', () => setLathe(!lathe.on));
 
 function makeGrid(){
   if (grid){ scene.remove(grid); grid.geometry.dispose(); grid.material.dispose(); grid = null; }
@@ -1773,6 +1798,7 @@ async function expand(f){
   return out;
 }
 function clearModel(){
+  lathe.on = false; lathe.node = null; $('#latheBtn').setAttribute('aria-pressed', 'false');
   setTool('select'); setHover(null); clearOverlays('sel'); clearGroup(dimGroup);
   parts.forEach(disposePart); parts = []; treeRoot = null; colorSeq = 0;
   ui.selNode = ui.moveNode = null; ui.picks = []; ui.result = null;
@@ -2002,6 +2028,7 @@ function makeMover(){
 }
 function startTour(){
   if (!localBox || !treeRoot) return;
+  if (lathe.on) setLathe(false);
   xr.secAnim = null; if (section.mode !== 'off') setSection({ mode:'off' });
   resetNode(treeRoot); ui.picks = []; xr.tab = 'misura'; setTool('measure'); afterMove();
   const from = placement('tavolo'), to = placement('1:1'), mc = modelBox.getCenter(V());
@@ -2234,13 +2261,13 @@ function buildButtons(){
   if (xr.demo && xr.tour) return rowBtns(640, 92, [{ id:'demo:tour', label:'Interrompi' }]);
   if (xr.demo) return [
     ...rowBtns(118, 70, [{ id:'demo:misura', label:'Misura', on:xr.tab === 'misura', tab:true }, { id:'demo:sposta', label:'Sposta', on:xr.tab === 'muovi', tab:true }, { id:'demo:sezione', label:'Sezione', on:section.mode !== 'off', tab:true }]),
-    ...rowBtns(640, 92, [{ id:'demo:tour', label:'Dimostrazione' }, { id:'demo:reset', label:'Ripristina' }, { id:'demo:qui', label:'Modello davanti' }, { id:'demo:off', label:'Menu completo' }]),
+    ...rowBtns(640, 92, [{ id:'demo:tour', label:'Dimostrazione' }, { id:'demo:reset', label:'Ripristina' }, { id:'demo:qui', label:'Modello davanti' }, { id:'lathe', label: lathe.on ? 'Ferma tornio' : 'Tornio', on:lathe.on }, { id:'demo:off', label:'Menu completo' }]),
   ];
   const b = rowBtns(118, 70, TABS.map(([id, label]) => ({ id:'tab:' + id, label, on:xr.tab === id, tab:true })));
   const on = section.mode !== 'off';
   if (xr.tab === 'modello'){
     b.push(...rowBtns(300, 120, [{ id:'1:1', label:'Scala 1:1', on:scaleNow() === 1 }, { id:'tavolo', label:'Sul tavolo', on:xr.mode === 'tavolo' && scaleNow() !== 1 }, { id:'terra', label:'Appoggia a terra' }, { id:'rot', label:'Ruota 90°' }]));
-    b.push(...rowBtns(436, 110, [{ id:'qui', label:'Modello davanti' }, { id:'nascondi', label:'Nascondi menu' }, { id:'demo:on', label:'Presentazione' }, { id:'esci', label:'Esci', danger:true }]));
+    b.push(...rowBtns(436, 110, [{ id:'qui', label:'Modello davanti' }, { id:'nascondi', label:'Nascondi menu' }, { id:'lathe', label: lathe.on ? 'Ferma tornio' : 'Tornio', on:lathe.on }, { id:'demo:on', label:'Presentazione' }, { id:'esci', label:'Esci', danger:true }]));
     b.push(...rowBtns(562, 96, [{ id:'win:qui', label:'Menu davanti a me' }, { id:'win:fisso', label:'Menu fisso', on:settings.panelMode === 'fisso' }, { id:'win:mano', label:'Menu sulla mano', on:settings.panelMode === 'mano' }]));
   } else if (xr.tab === 'misura'){
     b.push(...rowBtns(620, 110, [{ id:'pm:misura', label:'Misura', on:xr.pickMode === 'misura' }, { id:'pm:ingombro', label:'Ingombro', on:xr.pickMode === 'ingombro' }, { id:'clear', label:'Nuova misura' }]));
@@ -2310,7 +2337,8 @@ function drawPanelNow(){
     const name = treeRoot ? treeRoot.name : 'Nessun modello';
     txt(name.toUpperCase(), 30, 246, `600 40px ${DISPLAY}`, '#FFFFFF');
     if (modelBox){ const s = modelBox.getSize(V()); txt(`${nf(s.x,0)} × ${nf(s.y,0)} × ${nf(s.z,0)} mm · ${triCount().toLocaleString('it-IT')} triangoli`, 30, 284, `500 28px ${MONO}`, '#A9BCCB'); }
-    txt(settings.panelMode === 'fisso' ? 'Sposta il menu dalla barra in alto · il modello col grilletto sinistro' : 'Modello: grilletto sinistro o tasto laterale, due mani per scalare', 30, 708, `400 23px ${BODY}`, '#8FA3B3');
+    if (lathe.on){ const a = getAxis(lathe.node); txt(`TORNIO: ${lathe.node.name} gira sul suo asse${a.r ? ' · Ø ' + nf(2*a.r, 0) : ''} · 5 giri/min`, 30, 708, `600 24px ${BODY}`, '#FF8A66'); }
+    else txt(settings.panelMode === 'fisso' ? 'Sposta il menu dalla barra in alto · il modello col grilletto sinistro' : 'Modello: grilletto sinistro o tasto laterale, due mani per scalare', 30, 708, `400 23px ${BODY}`, '#8FA3B3');
   } else if (xr.tab === 'misura'){
     const r = ui.result;
     if (!r){ txt(xr.pickMode === 'misura' ? 'Punta un foro, uno spigolo, una faccia o un vertice.' : 'Punta un componente con la destra e premi il grilletto.', 30, 250, `400 28px ${BODY}`, '#C9D4DD'); txt('Due elementi danno distanza o angolo.', 30, 290, `400 28px ${BODY}`, '#8FA3B3'); }
@@ -2338,6 +2366,7 @@ function drawPanelNow(){
   } else {
   }
   if (xr.demo && !xr.tour && section.mode !== 'off') txt(sectionText(), 30, 606, `500 26px ${MONO}`, '#FF8A66');
+  if (xr.demo && !xr.tour && lathe.on) txt(`Tornio: ${lathe.node.name}`, 30, 570, `600 26px ${BODY}`, '#FF8A66');
   c.textBaseline = 'middle';
   BTN.forEach(b => {
     if (b.kind === 'name'){
@@ -2439,6 +2468,7 @@ function doAction(id){
     else { ui.facePending = false; setSection({ mode:b, keepNeg:true }); }
     drawPanel(); return;
   }
+  if (id === 'lathe'){ setLathe(!lathe.on); return; }
   if (a === 'ax'){
     const n = ui.moveNode; if (!n) return;
     if (b === '-') spinNode(n, 15); else if (b === '+') spinNode(n, -15); else { spin.on = !spin.on; }
@@ -2521,6 +2551,7 @@ renderer.setAnimationLoop(() => {
     if (xr.pending && xr.frames > 5){ place(xr.pending); xr.pending = null; }
     updatePads(dt); updateGrab(); updateDrags(); updatePanel(); updateXRHover();
   } else { orbit.update(); desktopHover(); }
+  if (lathe.on && lathe.node){ spinNode(lathe.node, -lathe.speed * dt); drawPanel(); }
   if (spin.on && ui.moveNode){ spinNode(ui.moveNode, -spin.speed * dt); drawPanel(); if ((xr.spinTick = (xr.spinTick || 0) + 1) % 15 === 0 && !renderer.xr.isPresenting){ const f = $('#axDeg'); if (f && document.activeElement !== f) f.value = (ui.moveNode.spinAngle || 0).toFixed(1); } }
   if (xr.tour) stepTour();
   stepSectionAnim();
