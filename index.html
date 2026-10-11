@@ -228,7 +228,7 @@ details.help[open] summary{margin-bottom:8px}
         <button type="button" data-view="right">Destra</button>
         <button type="button" data-view="fit" title="Adatta (F)">Adatta</button>
       </div>
-      <div class="tb"><button type="button" id="edgesBtn" aria-pressed="true">Spigoli</button><button type="button" id="latheBtn" aria-pressed="false" title="Fa girare il pezzo sul proprio asse, come sul tornio">Tornio</button></div>
+      <div class="tb"><button type="button" id="edgesBtn" aria-pressed="true">Spigoli</button><button type="button" id="weightBtn" aria-pressed="false" title="Peso e baricentro del pezzo">Peso</button><button type="button" id="latheBtn" aria-pressed="false" title="Fa girare il pezzo sul proprio asse, come sul tornio">Tornio</button></div>
     </div>
   </nav>
 
@@ -269,6 +269,9 @@ details.help[open] summary{margin-bottom:8px}
         </div>
         <div class="inline"><span class="muted">Unità dei file STL</span>
           <select id="stlUnit" aria-label="Unità dei file STL"><option value="mm">mm</option><option value="cm">cm</option><option value="m">m</option><option value="in">pollici</option></select>
+        </div>
+        <div class="inline"><span class="muted">Densità per il peso</span>
+          <span style="display:flex;align-items:center;gap:6px"><input type="number" id="density" step="0.01" min="0.1" style="width:72px;border:1px solid var(--line);border-radius:4px;padding:3px 6px;background:var(--panel-2);font-family:var(--f-mono);text-align:right" aria-label="Densità in kg/dm³"><span class="muted">kg/dm³</span></span>
         </div>
         <div class="inline"><span class="muted" title="Se nel visore il modello scatta, prova 85% o 70%. Vale dal prossimo ingresso nel visore.">Risoluzione nel visore</span>
           <select id="xrScale" aria-label="Risoluzione nel visore"><option value="1">100%</option><option value="0.85">85%</option><option value="0.7">70%</option></select>
@@ -386,7 +389,7 @@ function angularSpan(xs, ys, cx, cy){
 }
 
 /* ================= impostazioni ================= */
-const settings = (() => { const d = { up:'Y', origin:'base', stlUnit:'mm', edges:true, panelMode:'fisso', xrScale:1, demo:false }; try { return Object.assign(d, JSON.parse(localStorage.getItem('visore11v2') || '{}')); } catch { return d; } })();
+const settings = (() => { const d = { up:'Y', origin:'base', stlUnit:'mm', edges:true, panelMode:'fisso', density:7.85, xrScale:1, demo:false }; try { return Object.assign(d, JSON.parse(localStorage.getItem('visore11v2') || '{}')); } catch { return d; } })();
 const saveSettings = () => { try { localStorage.setItem('visore11v2', JSON.stringify(settings)); } catch {} };
 
 /* ================= scena ================= */
@@ -1020,8 +1023,74 @@ function measure2(e1, e2){
 function measureBox(n){
   const b = nodeBox(n), s = b.getSize(V());
   return { title:'Ingombro', value:`${nf(s.x, 1)} × ${nf(s.y, 1)} × ${nf(s.z, 1)}`, label:`${nf(s.x, 0)} × ${nf(s.y, 0)} × ${nf(s.z, 0)}`, sub:n.name,
-    rows:[['X', mm(s.x)], ['Y', mm(s.y)], ['Z', mm(s.z)], ['Min', `${nf(b.min.x,1)}; ${nf(b.min.y,1)}; ${nf(b.min.z,1)}`], ['Max', `${nf(b.max.x,1)}; ${nf(b.max.y,1)}; ${nf(b.max.z,1)}`]],
+    rows:[['X', mm(s.x)], ['Y', mm(s.y)], ['Z', mm(s.z)], ['Min', `${nf(b.min.x,1)}; ${nf(b.min.y,1)}; ${nf(b.min.z,1)}`], ['Max', `${nf(b.max.x,1)}; ${nf(b.max.y,1)}; ${nf(b.max.z,1)}`], ...(() => { const m = nodeMass(n); return [['Peso', kgText(m.kg)], ['Baricentro', `${nf(m.c.x,1)}; ${nf(m.c.y,1)}; ${nf(m.c.z,1)}`]]; })()],
     draw:{ box:b, at:V((b.min.x+b.max.x)/2, b.max.y, (b.min.z+b.max.z)/2) } };
+}
+
+/* peso e baricentro: volume del solido (somma dei tetraedri), densità dalle impostazioni */
+function partMass(p){
+  if (!p.massL){
+    const c = p.an.cpos, T = p.an.T; let v = 0, cx = 0, cy = 0, cz = 0;
+    for (let t = 0; t < T.length; t += 3){
+      const a = 3*T[t], b = 3*T[t+1], d = 3*T[t+2];
+      const ax = c[a], ay = c[a+1], az = c[a+2], bx = c[b], by = c[b+1], bz = c[b+2], dx = c[d], dy = c[d+1], dz = c[d+2];
+      const w = (ax*(by*dz - bz*dy) - ay*(bx*dz - bz*dx) + az*(bx*dy - by*dx)) / 6;
+      v += w; cx += w * (ax + bx + dx) / 4; cy += w * (ay + by + dy) / 4; cz += w * (az + bz + dz) / 4;
+    }
+    p.massL = { v:Math.abs(v), c: v ? V(cx / v, cy / v, cz / v) : p.geo.boundingBox.getCenter(V()) };
+  }
+  const k3 = p.k * p.k * p.k;
+  return { vol:p.massL.v * k3, c:toModel(p, p.massL.c) };   // mm³, mm
+}
+function nodeMass(n){
+  let vol = 0; const c = V();
+  for (const p of nodeParts(n)){ const m = partMass(p); vol += m.vol; c.addScaledVector(m.c, m.vol); }
+  if (vol > 0) c.divideScalar(vol);
+  return { vol, kg: vol * 1e-6 * settings.density, c };
+}
+const kgText = kg => kg >= 1000 ? nf(kg / 1000, 2) + ' t' : nf(kg, kg < 10 ? 2 : 0) + ' kg';
+function tagSprite(lines){
+  const cv = document.createElement('canvas'), x = cv.getContext('2d');
+  const F = [`700 64px ${DISPLAY}`, `600 92px ${MONO}`, `500 34px ${MONO}`, `400 30px ${BODY}`];
+  let W = 0; lines.forEach((t, i) => { x.font = F[Math.min(i, 3)]; W = Math.max(W, x.measureText(t).width); });
+  W = Math.ceil(W + 80); const H = 60 + lines.length * 0 + 70 + 104 + (lines.length - 2) * 48;
+  cv.width = W; cv.height = H;
+  x.fillStyle = 'rgba(20,26,33,0.94)'; x.beginPath(); x.roundRect(3, 3, W - 6, H - 6, 22); x.fill();
+  x.fillStyle = '#D2401A'; x.fillRect(3, 3, 14, H - 6);
+  x.textBaseline = 'alphabetic'; x.textAlign = 'left';
+  let y = 78;
+  lines.forEach((t, i) => {
+    x.font = F[Math.min(i, 3)]; x.fillStyle = i === 1 ? '#FF8A66' : i === 0 ? '#FFFFFF' : '#C9D4DD';
+    x.fillText(t, 44, y); y += i === 0 ? 104 : 48;
+  });
+  const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 4;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map:tex, depthTest:false, transparent:true }));
+  sp.renderOrder = 43; sp.userData.aspect = W / H; sp.raycast = () => {}; sp.center.set(0.5, 0);
+  return sized(sp, 0.13);
+}
+const weightGroup = new THREE.Group(); annot.add(weightGroup);
+const weight = { on:false, node:null };
+function drawWeight(){
+  clearGroup(weightGroup);
+  if (!weight.on || !weight.node || !parts.includes(nodeParts(weight.node)[0])) return;
+  const n = weight.node, m = nodeMass(n), b = nodeBox(n), s = b.getSize(V()), up = upAxis();
+  const top = b.getCenter(V()); top.addScaledVector(up, s.dot(up) / 2);
+  const tag = tagSprite([n.name.toUpperCase(), 'Peso ' + kgText(m.kg), `${nf(s.x,0)} × ${nf(s.y,0)} × ${nf(s.z,0)} mm`, `densità ${nf(settings.density, 2)} kg/dm³`]);
+  const lift = Math.max(s.length() * 0.08, 60);
+  tag.position.copy(top).addScaledVector(up, lift);
+  weightGroup.add(tag);
+  weightGroup.add(lineSeg([[top, tag.position.clone()]], dimLineMat));
+  // baricentro: pallino arancio, croce e scritta
+  weightGroup.add(marker(m.c, markerMat, 0.009));
+  const r = s.length() * 0.06, [u, w] = basis(up);
+  weightGroup.add(lineSeg([[m.c.clone().addScaledVector(u, -r), m.c.clone().addScaledVector(u, r)], [m.c.clone().addScaledVector(w, -r), m.c.clone().addScaledVector(w, r)], [m.c.clone().addScaledVector(up, -r), m.c.clone().addScaledVector(up, r)]]));
+  const g = labelSprite('Baricentro'); g.position.copy(m.c).addScaledVector(u, r * 1.2); weightGroup.add(g);
+}
+function setWeight(on){
+  if (on){ const n = latheNode(); if (!n) return; weight.node = n; weight.on = true; const m = nodeMass(n); setStatus(`${n.name}: peso ${kgText(m.kg)} (densità ${nf(settings.density, 2)} kg/dm³).`); }
+  else weight.on = false;
+  $('#weightBtn').setAttribute('aria-pressed', String(weight.on));
+  drawWeight(); drawPanel();
 }
 
 function drawResult(r){
@@ -1215,7 +1284,7 @@ function resetNode(n){
   const clear = x => { x.acc.identity(); x.spinAngle = 0; x.children.forEach(clear); };
   clear(n);
 }
-function afterMove(){ recompute(false); placeGizmo(); refreshPicks(); updateAxisLine(); }
+function afterMove(){ recompute(false); placeGizmo(); refreshPicks(); updateAxisLine(); drawWeight(); }
 
 /* rotazione sul proprio asse, come un pezzo sul mandrino del tornio */
 const axisGroup = new THREE.Group(); annot.add(axisGroup);
@@ -1619,6 +1688,13 @@ function setView(v){
 $('#edgesBtn').addEventListener('click', () => { settings.edges = !settings.edges; saveSettings(); $('#edgesBtn').setAttribute('aria-pressed', String(settings.edges)); parts.forEach(applyLook); });
 $('#edgesBtn').setAttribute('aria-pressed', String(settings.edges));
 $('#latheBtn').addEventListener('click', () => setLathe(!lathe.on));
+$('#weightBtn').addEventListener('click', () => setWeight(!weight.on));
+$('#density').value = settings.density;
+$('#density').addEventListener('change', e => {
+  const v = parseFloat(String(e.target.value).replace(',', '.'));
+  if (!(v > 0)) { e.target.value = settings.density; return; }
+  settings.density = v; saveSettings(); drawWeight(); refreshPicks();
+});
 
 function makeGrid(){
   if (grid){ scene.remove(grid); grid.geometry.dispose(); grid.material.dispose(); grid = null; }
@@ -1798,6 +1874,7 @@ async function expand(f){
   return out;
 }
 function clearModel(){
+  weight.on = false; weight.node = null; clearGroup(weightGroup); $('#weightBtn').setAttribute('aria-pressed', 'false');
   lathe.on = false; lathe.node = null; $('#latheBtn').setAttribute('aria-pressed', 'false');
   setTool('select'); setHover(null); clearOverlays('sel'); clearGroup(dimGroup);
   parts.forEach(disposePart); parts = []; treeRoot = null; colorSeq = 0;
@@ -1970,7 +2047,7 @@ function place(kind){
 const TOUR = [
   { at:0,  title:'Modello' },
   { at:4,  title:'Grandezza reale' },
-  { at:9,  title:'Ingombro' },
+  { at:9,  title:'Ingombro e peso' },
   { at:14, title:'Misure dal CAD' },
   { at:20, title:'Sezione' },
   { at:27, title:'Componenti' },
@@ -2051,7 +2128,8 @@ function endTour(stopped){
 function tourEnter(i){
   const T = xr.tour;
   ui.picks = []; refreshPicks();   // toglie quote ed evidenziazioni del passo prima
-  if (i === 2){ ui.result = measureBox(treeRoot); drawResult(ui.result); }
+  if (i === 2){ ui.result = measureBox(treeRoot); drawResult(ui.result); setWeight(true); }
+  if (i === 3 && weight.on) setWeight(false);
   else if (i === 3 && T.cyls[0]) showCylinder(T.cyls[0]);
   else if (i === 4){ const L = smartSection(); T.secOnAxis = !!(L && L.onAxis); sweepSection(L); }
   else if (i === 5){ if (section.mode !== 'off') setSection({ mode:'off' }); if (!T.boom) T.mover = makeMover(); }
@@ -2062,7 +2140,7 @@ function tourLines(i){
   switch (i){
     case 0: return [treeRoot ? treeRoot.name : '', `${single ? 'Componente singolo' : parts.length + ' componenti'} · ${dims}`];
     case 1: return ['Scala 1:1: misure vere, nello spazio reale.'];
-    case 2: return [dims, single ? 'Ingombro del pezzo.' : 'Ingombro totale dell\'assieme.'];
+    case 2: { const n = weight.node || treeRoot, m = n ? nodeMass(n) : null; return [dims, m ? `${n.name}: peso ${kgText(m.kg)}, baricentro segnato.` : (single ? 'Ingombro del pezzo.' : 'Ingombro totale dell\'assieme.')]; }
     case 3: return T.cyls.length && ui.result && ui.picks.length ? [`${ui.result.title}: ${ui.result.value}`, `${ui.picks[0].part.name} · valore esatto del modello`] : ['Fori, spigoli e facce si misurano puntandoli.'];
     case 4: return [T.secOnAxis ? 'Taglio passante per l\'asse del pezzo.' : sectionText(), 'Sezione tratteggiata, come sul disegno.'];
     case 5: return T.boom ? [`Esploso dell'assieme: ${parts.length} componenti.`, 'Ogni componente si può spostare con la mano.']
@@ -2260,13 +2338,13 @@ function buildButtons(){
   // presentazione: stesso aspetto del menu normale, con i soli tre strumenti
   if (xr.demo && xr.tour) return rowBtns(640, 92, [{ id:'demo:tour', label:'Interrompi' }]);
   if (xr.demo) return [
-    ...rowBtns(118, 70, [{ id:'demo:misura', label:'Misura', on:xr.tab === 'misura', tab:true }, { id:'demo:sposta', label:'Sposta', on:xr.tab === 'muovi', tab:true }, { id:'demo:sezione', label:'Sezione', on:section.mode !== 'off', tab:true }]),
+    ...rowBtns(118, 70, [{ id:'demo:misura', label:'Misura', on:xr.tab === 'misura', tab:true }, { id:'demo:sposta', label:'Sposta', on:xr.tab === 'muovi', tab:true }, { id:'demo:sezione', label:'Sezione', on:section.mode !== 'off', tab:true }, { id:'weight', label:'Peso', on:weight.on, tab:true }]),
     ...rowBtns(640, 92, [{ id:'demo:tour', label:'Dimostrazione' }, { id:'demo:reset', label:'Ripristina' }, { id:'demo:qui', label:'Modello davanti' }, { id:'lathe', label: lathe.on ? 'Ferma tornio' : 'Tornio', on:lathe.on }, { id:'demo:off', label:'Menu completo' }]),
   ];
   const b = rowBtns(118, 70, TABS.map(([id, label]) => ({ id:'tab:' + id, label, on:xr.tab === id, tab:true })));
   const on = section.mode !== 'off';
   if (xr.tab === 'modello'){
-    b.push(...rowBtns(300, 120, [{ id:'1:1', label:'Scala 1:1', on:scaleNow() === 1 }, { id:'tavolo', label:'Sul tavolo', on:xr.mode === 'tavolo' && scaleNow() !== 1 }, { id:'terra', label:'Appoggia a terra' }, { id:'rot', label:'Ruota 90°' }]));
+    b.push(...rowBtns(300, 120, [{ id:'1:1', label:'Scala 1:1', on:scaleNow() === 1 }, { id:'tavolo', label:'Sul tavolo', on:xr.mode === 'tavolo' && scaleNow() !== 1 }, { id:'terra', label:'Appoggia a terra' }, { id:'rot', label:'Ruota 90°' }, { id:'weight', label:'Peso', on:weight.on }]));
     b.push(...rowBtns(436, 110, [{ id:'qui', label:'Modello davanti' }, { id:'nascondi', label:'Nascondi menu' }, { id:'lathe', label: lathe.on ? 'Ferma tornio' : 'Tornio', on:lathe.on }, { id:'demo:on', label:'Presentazione' }, { id:'esci', label:'Esci', danger:true }]));
     b.push(...rowBtns(562, 96, [{ id:'win:qui', label:'Menu davanti a me' }, { id:'win:fisso', label:'Menu fisso', on:settings.panelMode === 'fisso' }, { id:'win:mano', label:'Menu sulla mano', on:settings.panelMode === 'mano' }]));
   } else if (xr.tab === 'misura'){
@@ -2469,6 +2547,7 @@ function doAction(id){
     drawPanel(); return;
   }
   if (id === 'lathe'){ setLathe(!lathe.on); return; }
+  if (id === 'weight'){ setWeight(!weight.on); return; }
   if (a === 'ax'){
     const n = ui.moveNode; if (!n) return;
     if (b === '-') spinNode(n, 15); else if (b === '+') spinNode(n, -15); else { spin.on = !spin.on; }
