@@ -730,8 +730,9 @@ function makePart({ name, geo, color, k=1, brep=null, kind='step' }){
 }
 function applyK(p){
   p.wrap.scale.setScalar(p.k);
-  const s = new THREE.Matrix4().makeScale(1/p.k, 1/p.k, 1/p.k), si = new THREE.Matrix4().makeScale(p.k, p.k, p.k);
-  p.mesh.matrix.copy(s).multiply(p.xf).multiply(si);
+  // S(1/k)·xf·S(k) senza creare matrici nuove (si chiama a ogni fotogramma quando il pezzo gira)
+  const k = p.k, e = p.mesh.matrix.copy(p.xf).elements;
+  e[12] /= k; e[13] /= k; e[14] /= k; e[3] *= k; e[7] *= k; e[11] *= k;
   p.mesh.matrixWorldNeedsUpdate = true;
 }
 function applyLook(p){
@@ -752,6 +753,10 @@ const dirToModel = (p, d) => d.clone().transformDirection(p.xf);
 
 /* ================= albero ================= */
 function nodeParts(n){ return n.part ? [n.part] : n.children.flatMap(nodeParts); }
+const _M1 = new THREE.Matrix4(), _vA = new THREE.Vector3(), _vB = new THREE.Vector3();
+// rotazione attorno al punto c: R con la traslazione c − R·c (nessuna allocazione)
+function rotAboutM(M, c){ _vA.copy(c).applyMatrix3(_m3.setFromMatrix4(M)); M.setPosition(c.x - _vA.x, c.y - _vA.y, c.z - _vA.z); return M; }
+const _m3 = new THREE.Matrix3();
 function linkTree(n, parent=null, lvl=0){
   n.parent = parent; n.lvl = lvl; n.id ??= 'n' + Math.random().toString(36).slice(2, 9);
   n.acc ??= new THREE.Matrix4();
@@ -1251,9 +1256,13 @@ function placeGizmo(){
 function updateGizmoAxes(){
   tc.showX = tc.showY = tc.showZ = true;
 }
+// ogni spostamento invalida l'asse memorizzato del nodo, dei suoi figli e dei suoi genitori
+function bumpVer(n){ const up = x => { for (; x; x = x.parent) x.accVer = (x.accVer || 0) + 1; }; const down = x => { x.accVer = (x.accVer || 0) + 1; x.children.forEach(down); }; up(n.parent); down(n); }
 function applyNodeMatrix(n, M){
-  nodeParts(n).forEach(p => { p.xf.premultiply(M); applyK(p); });
+  if (!n.partsCache) n.partsCache = nodeParts(n);
+  for (const p of n.partsCache){ p.xf.premultiply(M); applyK(p); }
   n.acc.premultiply(M);
+  bumpVer(n);
 }
 const upAxis = () => settings.up === 'Z' ? AX.z : AX.y;
 function nodeMoveState(n){
@@ -1276,10 +1285,7 @@ function rotateNodeQuat(n, dq, c){
   applyNodeMatrix(n, M);
 }
 function rotateNodeAbout(n, degs, c){
-  const M = new THREE.Matrix4().makeTranslation(c.x, c.y, c.z)
-    .multiply(new THREE.Matrix4().makeRotationAxis(upAxis(), degs * Math.PI / 180))
-    .multiply(new THREE.Matrix4().makeTranslation(-c.x, -c.y, -c.z));
-  applyNodeMatrix(n, M);
+  applyNodeMatrix(n, rotAboutM(_M1.makeRotationAxis(upAxis(), degs * Math.PI / 180), c));
 }
 function resetNode(n){
   nodeParts(n).forEach(p => { p.xf.identity(); applyK(p); });
@@ -1328,12 +1334,12 @@ function getAxis(n){
   if (a) return { d:dirToModel(a.part, a.dirL).normalize(), p:toModel(a.part, a.ptL), r:a.r };
   return { d:upAxis().clone(), p:V(), r:0 };
 }
+// l'asse è legato al pezzo: girando su sé stesso non cambia, quindi lo si calcola una volta sola
 function spinNode(n, degs){
-  const a = getAxis(n);
-  const M = new THREE.Matrix4().makeTranslation(a.p.x, a.p.y, a.p.z)
-    .multiply(new THREE.Matrix4().makeRotationAxis(a.d, degs * Math.PI / 180))
-    .multiply(new THREE.Matrix4().makeTranslation(-a.p.x, -a.p.y, -a.p.z));
-  applyNodeMatrix(n, M);
+  let a = n.spinAx;
+  if (!a || a.node !== n || a.ver !== n.accVer){ const g = getAxis(n); a = n.spinAx = { node:n, d:g.d, p:g.p, ver:n.accVer }; }
+  applyNodeMatrix(n, rotAboutM(_M1.makeRotationAxis(a.d, degs * Math.PI / 180), a.p));
+  n.accVer = a.ver;   // la rotazione sul proprio asse non sposta l'asse
   n.spinAngle = (((n.spinAngle || 0) + degs) % 360 + 360) % 360;
 }
 function updateAxisLine(){
@@ -1471,7 +1477,7 @@ function updateStencilVis(p){
   const on = section.mode !== 'off' && section.fill && p.visible && !p.ghost;
   p.stencil.forEach(s => s.visible = on);
 }
-function setSection(patch){
+function setSection(patch, soft=false){
   const wasOn = section.mode !== 'off';
   if (patch.mode && patch.mode !== section.mode && AX[patch.mode]){
     section.a = AX[patch.mode].clone(); Object.assign(section, patch); sectionRangeUpdate();
@@ -1483,7 +1489,7 @@ function setSection(patch){
   if (on !== wasOn) setClipMats(on);
   parts.forEach(updateStencilVis);
   if (on && !xr.secAnim) lastSection = { mode:section.mode, a:section.a.clone(), pos:section.pos, base:section.base, keepNeg:section.keepNeg };
-  updateClip(); updateSecVis(); updateCap(); renderSectionUI(); drawPanel(); updateStatusRight();
+  updateClip(); updateSecVis(); updateCap(); renderSectionUI(); if (soft) drawPanelSoft(); else drawPanel(); updateStatusRight();
 }
 // presentazione: il taglio entra piano nel pezzo. Usa l'ultimo taglio impostato a mano; se non c'è,
 // un piano che passa per l'asse del cilindro principale con la faccia tagliata verso chi guarda; altrimenti X a metà
@@ -1614,7 +1620,7 @@ function startSecDrag(ray){
 function moveSecDrag(ray){
   if (!secDrag) return;
   const t = paramOnNormal(ray, secDrag.P, section.a); if (t === null) return;
-  setSection({ pos: secDrag.pos0 + (t - secDrag.t0) });
+  setSection({ pos: secDrag.pos0 + (t - secDrag.t0) }, true);
 }
 function knobHitTest(ray){
   if (!secVis.visible) return false;
@@ -2423,7 +2429,7 @@ function updateGrab(){
       const wasOne = scaleNow() === 1;
       xr.rawScale = THREE.MathUtils.clamp(xr.rawScale * vN.length() / vP.length(), 0.002, 2);
       const target = Math.abs(xr.rawScale - 1) < 0.06 ? 1 : xr.rawScale;
-      if (target !== scaleNow()){ scaleTo(midP, target); if (target === 1 && !wasOne){ buzz(a, .7, 70); buzz(b, .7, 70); } drawPanel(); }
+      if (target !== scaleNow()){ scaleTo(midP, target); if (target === 1 && !wasOne){ buzz(a, .7, 70); buzz(b, .7, 70); } if (target === 1) drawPanel(); else drawPanelSoft(); }
       if (Math.hypot(vP.x, vP.z) > .05 && Math.hypot(vN.x, vN.z) > .05) rotateAbout(midP, wrapA(Math.atan2(vN.x, vN.z) - Math.atan2(vP.x, vP.z)));
     }
     root.position.add(midN.sub(midP));
@@ -2446,12 +2452,12 @@ function updateDrags(){
         moveNodeBy(ui.moveNode, dp);
         d.c.add(dp);
         if (Math.abs(dqm.w) < 0.99999995) rotateNodeQuat(ui.moveNode, dqm, d.c);
-        drawPanel();
+        drawPanelSoft();
       } else {
         const a = AX[xr.axisLock], delta = gNow.clone().sub(d.start);
         delta.copy(a).multiplyScalar(Math.round(delta.dot(a)));
         const step = delta.clone().sub(d.applied);
-        if (step.lengthSq() > 0){ moveNodeBy(ui.moveNode, step); d.applied.copy(delta); d.c.add(step); drawPanel(); }
+        if (step.lengthSq() > 0){ moveNodeBy(ui.moveNode, step); d.applied.copy(delta); d.c.add(step); drawPanelSoft(); }
       }
       d.gPrev = gNow; d.qPrev = qNow;
     }
@@ -2465,14 +2471,14 @@ function updatePads(dt){
     if (!gp || c.userData.hand) continue;
     const x = dz(gp.axes[2] || 0), y = dz(gp.axes[3] || 0);
     const btn = gp.buttons.map(b => b.pressed), prev = c.userData.prevBtn, hit = i => btn[i] && !prev[i];
-    if (c.userData.drag && c.userData.drag.kind === 'move'){ if (x && ui.moveNode){ rotateNodeAbout(ui.moveNode, -x * 60 * dt, c.userData.drag.c); drawPanel(); } c.userData.prevBtn = btn; continue; }
+    if (c.userData.drag && c.userData.drag.kind === 'move'){ if (x && ui.moveNode){ rotateNodeAbout(ui.moveNode, -x * 60 * dt, c.userData.drag.c); drawPanelSoft(); } c.userData.prevBtn = btn; continue; }
     if (c.userData.drag === 'panel'){ if (y && xr.panelDrag) xr.panelDrag.dist = THREE.MathUtils.clamp(xr.panelDrag.dist - y * 0.8 * dt, 0.25, 3); c.userData.prevBtn = btn; continue; }
     if (c.userData.side === 'left'){
       if (x || y){ const f = headDir(), r = V(-f.z, 0, f.x), sp = 1.4 * dt; root.position.addScaledVector(r, -x * sp).addScaledVector(f, y * sp); }
       if (hit(4)) onFloor();
       if (hit(5)) setPanel(!panel.visible, true);
     } else {
-      if (x && xr.tab === 'muovi' && ui.moveNode){ spinNode(ui.moveNode, -x * 90 * dt); drawPanel(); xr.spun = true; }
+      if (x && xr.tab === 'muovi' && ui.moveNode){ spinNode(ui.moveNode, -x * 90 * dt); drawPanelSoft(); xr.spun = true; }
       else if (x && localBox) rotateAbout(centerWorld(), -x * 1.1 * dt);
       if (!x && xr.spun){ xr.spun = false; afterMove(); }
       if (y) root.position.y += -y * 0.6 * dt;
@@ -2509,7 +2515,7 @@ function buildButtons(){
   const b = rowBtns(118, 70, TABS.map(([id, label]) => ({ id:'tab:' + id, label, on:xr.tab === id, tab:true })));
   const on = section.mode !== 'off';
   if (xr.tab === 'modello'){
-    b.push(...rowBtns(300, 120, [{ id:'1:1', label:'Scala 1:1', on:scaleNow() === 1 }, { id:'tavolo', label:'Sul tavolo', on:xr.mode === 'tavolo' && scaleNow() !== 1 }, { id:'terra', label:'Appoggia a terra' }, { id:'rot', label:'Ruota 90°' }, { id:'weight', label:'Peso', on:weight.on }]));
+    b.push(...rowBtns(300, 120, [{ id:'1:1', label:'Scala 1:1', on:scaleNow() === 1 }, { id:'tavolo', label:'Sul tavolo', on:xr.mode === 'tavolo' && scaleNow() !== 1 }, { id:'terra', label:'A terra' }, { id:'rot', label:'Ruota 90°' }, { id:'weight', label:'Peso', on:weight.on }]));
     b.push(...rowBtns(436, 110, [{ id:'qui', label:'Modello davanti' }, { id:'nascondi', label:'Nascondi menu' }, { id:'lathe', label: lathe.on ? 'Ferma tornio' : 'Tornio', on:lathe.on }, { id:'demo:on', label:'Presentazione' }, { id:'esci', label:'Esci', danger:true }]));
     b.push(...rowBtns(562, 96, [{ id:'win:qui', label:'Menu davanti a me' }, { id:'win:fisso', label:'Menu fisso', on:settings.panelMode === 'fisso' }, { id:'win:mano', label:'Menu sulla mano', on:settings.panelMode === 'mano' }]));
   } else if (xr.tab === 'misura'){
@@ -2537,10 +2543,25 @@ function buildButtons(){
 }
 function fit(c, t, max){ if (c.measureText(t).width <= max) return t; while (t.length > 1 && c.measureText(t + '…').width > max) t = t.slice(0, -1); return t + '…'; }
 function scaleLabel(){ const s = scaleNow(); if (s === 1) return '1:1'; return s < 1 ? '1:' + Math.round(1/s) : nf(s, 2) + ':1'; }
-let panelDirty = true, panelLast = 0;
-function drawPanel(){ panelDirty = true; }
+let panelDirty = true, panelSoft = false, panelLast = 0;
+function drawPanel(){ panelDirty = true; }        // tasto premuto o puntato: aggiorna subito
+function drawPanelSoft(){ panelSoft = true; }     // valori che cambiano mentre qualcosa si muove: al massimo 2 volte al secondo
+/* FPS su una targhetta piccola separata, così non si ridisegna tutto il menu ogni secondo */
+const fpsC = document.createElement('canvas'); fpsC.width = 256; fpsC.height = 48;
+const fpsTex = new THREE.CanvasTexture(fpsC); fpsTex.colorSpace = THREE.SRGBColorSpace;
+const fpsTag = new THREE.Mesh(new THREE.PlaneGeometry(0.064, 0.012), new THREE.MeshBasicMaterial({ map:fpsTex, transparent:true, depthTest:false }));
+fpsTag.renderOrder = 1000; fpsTag.position.set(0.32/2 - 0.036, 0.32 * PH / PW / 2 + 0.009, 0.001); panel.add(fpsTag);
+let fpsShown = -1;
+function drawFps(v){
+  if (v === fpsShown) return; fpsShown = v;
+  const c = fpsC.getContext('2d'); c.clearRect(0, 0, 256, 48);
+  c.beginPath(); c.roundRect(2, 2, 252, 44, 14); c.fillStyle = 'rgba(16,21,27,0.85)'; c.fill();
+  c.font = `600 28px ${DISPLAY}`; c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.fillStyle = v >= 65 ? '#7FD69B' : v >= 45 ? '#FFC266' : '#FF7A66'; c.fillText(`${v} FPS`, 128, 26);
+  fpsTex.needsUpdate = true;
+}
 function drawPanelNow(){
-  panelDirty = false; panelLast = performance.now();
+  panelDirty = false; panelSoft = false; panelLast = performance.now();
   BTN = buildButtons();
   const c = pctx;
   c.clearRect(0, 0, PW, PH);
@@ -2553,7 +2574,7 @@ function drawPanelNow(){
   }
   if (logoImg.complete && logoImg.naturalWidth){ const h = 62; c.drawImage(logoImg, 30, 26, h * logoImg.naturalWidth / logoImg.naturalHeight, h); }
   c.textAlign = 'right'; c.textBaseline = 'alphabetic';
-  c.font = `600 22px ${DISPLAY}`; c.fillStyle = '#8FA3B3'; c.fillText(renderer.xr.isPresenting && xr.fps ? `${xr.fps} FPS · SCALA` : 'SCALA', PW-30, 42);
+  c.font = `600 22px ${DISPLAY}`; c.fillStyle = '#8FA3B3'; c.fillText('SCALA', PW-30, 42);
   c.font = `700 54px ${DISPLAY}`; c.fillStyle = scaleNow() === 1 ? '#FF8A66' : '#FFFFFF'; c.fillText(scaleLabel(), PW-30, 96);
   const txt = (t, x, y, font, col, align='left', max=PW-60) => { c.font = font; c.fillStyle = col; c.textAlign = align; c.fillText(fit(c, t, max), x, y); };
   c.textBaseline = 'alphabetic';
@@ -2792,17 +2813,20 @@ renderer.setAnimationLoop(() => {
     const now = performance.now();
     xr.fpsN = (xr.fpsN || 0) + 1;
     if (!xr.fpsT) xr.fpsT = now;
-    if (now - xr.fpsT >= 1000){ xr.fps = Math.round(xr.fpsN * 1000 / (now - xr.fpsT)); xr.fpsN = 0; xr.fpsT = now; panelDirty = true; }
+    if (now - xr.fpsT >= 1000){ xr.fps = Math.round(xr.fpsN * 1000 / (now - xr.fpsT)); xr.fpsN = 0; xr.fpsT = now; drawFps(xr.fps); }
     if (xr.pending && xr.frames > 5){ place(xr.pending); xr.pending = null; }
     updatePads(dt); updateGrab(); updateDrags(); updatePanel(); updateXRHover();
   } else { orbit.update(); desktopHover(); }
-  if (lathe.on && lathe.node){ spinNode(lathe.node, -lathe.speed * dt); drawPanel(); }
-  if (spin.on && ui.moveNode){ spinNode(ui.moveNode, -spin.speed * dt); drawPanel(); if ((xr.spinTick = (xr.spinTick || 0) + 1) % 15 === 0 && !renderer.xr.isPresenting){ const f = $('#axDeg'); if (f && document.activeElement !== f) f.value = (ui.moveNode.spinAngle || 0).toFixed(1); } }
+  if (lathe.on && lathe.node){ spinNode(lathe.node, -lathe.speed * dt); drawPanelSoft(); }
+  if (spin.on && ui.moveNode){ spinNode(ui.moveNode, -spin.speed * dt); drawPanelSoft(); if ((xr.spinTick = (xr.spinTick || 0) + 1) % 15 === 0 && !renderer.xr.isPresenting){ const f = $('#axDeg'); if (f && document.activeElement !== f) f.value = (ui.moveNode.spinAngle || 0).toFixed(1); } }
   if (xr.tour) stepTour();
   stepSectionAnim();
   if (section.mode !== 'off'){ updateClip(); updateCap(); updateSecVis(); }
   updateSizers();
-  if (panelDirty && (panel.visible || !renderer.xr.isPresenting) && performance.now() - panelLast > (renderer.xr.isPresenting ? 120 : 250)) drawPanelNow();
+  if ((panelDirty || panelSoft) && (panel.visible || !renderer.xr.isPresenting)){
+    const since = performance.now() - panelLast;
+    if ((panelDirty && since > (renderer.xr.isPresenting ? 120 : 250)) || since > 500) drawPanelNow();
+  }
   renderer.render(scene, camera);
   if (!renderer.xr.isPresenting) renderTriad();
 });
@@ -2813,7 +2837,7 @@ recompute(); resize(); makeGrid(); renderTree(); renderHint(); renderSectionUI()
 refreshPicks(); updateStatusRight();
 setStatus('Esempio caricato. Apri uno STEP dell\'assieme per lavorare sul tuo modello.');
 detectXR();
-window.__app = { ctrls, updateDrags, nodeBox, pc, doAction, drawPanel, xr, parts, get treeRoot(){ return treeRoot; }, ui, section, setTool, onPick, pickRay, entity, measure1, measure2, openFiles, setSection, selectNode, setMoveNode, moveNodeBy, rotateNodeBy, camera, raycaster, renderer, faceInfo, curveInfo, get allParts(){ return parts; } };
+window.__app = { THREE, spinNode, drawFps, fpsC, ctrls, updateDrags, nodeBox, pc, doAction, drawPanel, xr, parts, get treeRoot(){ return treeRoot; }, ui, section, setTool, onPick, pickRay, entity, measure1, measure2, openFiles, setSection, selectNode, setMoveNode, moveNodeBy, rotateNodeBy, camera, raycaster, renderer, faceInfo, curveInfo, get allParts(){ return parts; } };
 </script>
 </body>
 </html>
